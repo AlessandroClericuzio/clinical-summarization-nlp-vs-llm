@@ -3,21 +3,14 @@ LLMPipeline.py — Pipeline B: Generative LLM (Abstractive)
 Progetto NLP: Clinical Summarization — NLP Tradizionale vs LLM
 
 Supporta:
-  - Modelli con context window ≥ 32k (Mixtral, Mistral v0.2/v0.3)
+  - Qualsiasi modello disponibile su Ollama (es. mixtral, mistral, llama3, ecc.)
   - Strategie di prompting: zero-shot, few-shot, chain-of-thought (CoT)
-  - Quantizzazione 4-bit per ridurre l'ingombro VRAM
+  - Backend: Ollama (HTTP API locale)
 """
 
 import logging
+import requests
 from typing import Optional
-
-import torch
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BitsAndBytesConfig,
-    pipeline,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -63,15 +56,14 @@ FEW_SHOT_EXAMPLES = [
 
 class LLMPipeline:
     """
-    Pipeline B per generazione astrattiva con LLM.
+    Pipeline B per generazione astrattiva con LLM tramite Ollama.
 
     Args:
-        model_name: Nome del modello HF (es. 'mistralai/Mixtral-8x7B-Instruct-v0.1')
-        prompting_strategy: 'zero-shot', 'few-shot', 'cot'
-        temperature: temperatura di sampling (bassa per ridurre allucinazioni)
-        max_new_tokens: numero massimo di token generati
-        use_4bit: se True carica il modello in 4-bit (bitsandbytes)
-        device_map: 'auto' per distribuzione automatica
+        model_name:          Nome del modello Ollama (es. 'mixtral', 'mistral', 'llama3')
+        prompting_strategy:  'zero-shot', 'few-shot', 'cot'
+        temperature:         Temperatura di sampling (bassa per ridurre allucinazioni)
+        max_new_tokens:      Numero massimo di token generati
+        ollama_host:         URL base dell'istanza Ollama (default: http://localhost:11434)
     """
 
     def __init__(
@@ -79,7 +71,9 @@ class LLMPipeline:
         model_name: str,
         prompting_strategy: str = "few-shot",
         temperature: float = 0.1,
-        max_new_tokens: int = 256,
+        max_new_tokens: int = 4096,
+        ollama_host: str = "http://localhost:11434",
+        # Mantenuti per compatibilità con il codice esistente, non usati con Ollama
         use_4bit: bool = False,
         device_map: str = "auto",
     ):
@@ -87,51 +81,36 @@ class LLMPipeline:
         self.prompting_strategy = prompting_strategy
         self.temperature = temperature
         self.max_new_tokens = max_new_tokens
+        self.ollama_host = ollama_host.rstrip("/")
+        self.api_url = f"{self.ollama_host}/api/generate"
 
-        logger.info(f"Caricamento modello LLM: {model_name}")
-        self._load_model(use_4bit, device_map)
+        logger.info(f"Connessione a Ollama: {self.ollama_host} — modello: {model_name}")
+        self._check_ollama()
 
-        # Imposta tokenizer per troncamento a sinistra (per mantenere il più possibile il contesto)
-        self.tokenizer.truncation_side = "left"
-        # La context window effettiva dipende dal modello; per Mixtral/Mistral v0.2 è 32768
-        self.max_context_len = min(
-            self.tokenizer.model_max_length,
-            32768  # safe per Mixtral/Mistral v0.2
-        )
-
-    def _load_model(self, use_4bit: bool, device_map: str):
-        """Carica modello e tokenizer con configurazione di quantizzazione."""
-        if use_4bit:
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16,
+    def _check_ollama(self):
+        """Verifica che Ollama sia raggiungibile e che il modello sia disponibile."""
+        try:
+            resp = requests.get(f"{self.ollama_host}/api/tags", timeout=5)
+            resp.raise_for_status()
+            available = [m["name"] for m in resp.json().get("models", [])]
+            # Controlla sia il nome esatto che il nome senza tag (es. "mixtral" vs "mixtral:latest")
+            names_bare = [n.split(":")[0] for n in available]
+            if self.model_name not in available and self.model_name not in names_bare:
+                logger.warning(
+                    f"Modello '{self.model_name}' non trovato in Ollama. "
+                    f"Disponibili: {available}. "
+                    f"Esegui: ollama pull {self.model_name}"
+                )
+            else:
+                logger.info(f"Modello '{self.model_name}' disponibile su Ollama.")
+        except requests.exceptions.ConnectionError:
+            raise RuntimeError(
+                f"Ollama non raggiungibile su {self.ollama_host}. "
+                "Assicurati che il servizio sia avviato con: ollama serve"
             )
-        else:
-            bnb_config = None
-
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.model_name,
-            trust_remote_code=True,
-        )
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_name,
-            device_map=device_map,
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16,
-        )
-        self.model.eval()
-
-        logger.info(f"Modello caricato. Context window: {self.max_context_len}")
 
     def _build_prompt(self, article: str) -> str:
-        """
-        Costruisce il prompt in base alla strategia selezionata.
-        """
+        """Costruisce il prompt in base alla strategia selezionata."""
         if self.prompting_strategy == "zero-shot":
             return self._zero_shot_prompt(article)
         elif self.prompting_strategy == "few-shot":
@@ -151,7 +130,6 @@ class LLMPipeline:
         )
 
     def _few_shot_prompt(self, article: str) -> str:
-        # Costruiamo il few-shot con gli esempi
         few_shot_text = ""
         for ex in FEW_SHOT_EXAMPLES:
             few_shot_text += (
@@ -181,69 +159,43 @@ class LLMPipeline:
             f"### Summary:\n"
         )
 
-    def _truncate_to_context(self, prompt: str) -> str:
-        """
-        Tronca il prompt a sinistra per rispettare la context window,
-        lasciando spazio per la risposta (max_new_tokens).
-        """
-        # Stimiamo il numero di token del prompt
-        tokens = self.tokenizer.encode(prompt, add_special_tokens=False)
-        max_allowed = self.max_context_len - self.max_new_tokens - 50  # margine di sicurezza
-
-        if len(tokens) <= max_allowed:
-            return prompt
-
-        # Tronca a sinistra mantenendo l'inizio del prompt? Meglio mantenere l'istruzione e l'inizio dell'articolo.
-        # Poiché usiamo truncation_side="left", il tokenizer troncherà a sinistra automaticamente.
-        # Ma per sicurezza, possiamo pre-troncare l'articolo.
-        # Approccio: manteniamo solo la parte finale dell'articolo (ultimi N token)
-        # e reinseriamo il prefisso.
-        # Tuttavia, la tokenizzazione del modello applicherà il troncamento a sinistra.
-        return prompt  # lasceremo che il tokenizer faccia il lavoro
-
     def generate_summary(self, article: str) -> str:
-        """Genera un riassunto per un singolo articolo."""
-        if not article or not article.strip():
+        """Genera un riassunto per un singolo articolo tramite Ollama."""
+        # Gestisce NaN (float) o qualsiasi valore non-stringa
+        if not isinstance(article, str) or not article.strip():
             return ""
 
         prompt = self._build_prompt(article)
 
-        # Tokenizza con troncamento a sinistra
-        inputs = self.tokenizer(
-            prompt,
-            return_tensors="pt",
-            truncation=True,
-            max_length=self.max_context_len - self.max_new_tokens,
-            padding=False,
-        )
+        payload = {
+            "model": self.model_name,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": self.temperature,
+                "num_predict": self.max_new_tokens,
+                "top_p": 0.95,
+                "repeat_penalty": 1.15,
+            },
+        }
 
-        # Sposta su GPU se necessario
-        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
-
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=self.max_new_tokens,
-                temperature=self.temperature,
-                do_sample=True,
-                top_p=0.95,
-                repetition_penalty=1.15,    
-                pad_token_id=self.tokenizer.eos_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-            )
-
-        # Decodifica saltando il prompt
-        generated = outputs[0][inputs["input_ids"].shape[1]:]
-        summary = self.tokenizer.decode(generated, skip_special_tokens=True)
+        try:
+            resp = requests.post(self.api_url, json=payload, timeout=120)
+            resp.raise_for_status()
+            summary = resp.json().get("response", "").strip()
+        except requests.exceptions.Timeout:
+            logger.error("Timeout nella richiesta a Ollama.")
+            return ""
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Errore nella richiesta a Ollama: {e}")
+            return ""
 
         # Se la strategia è CoT, estraiamo la parte dopo "### Summary:"
         if self.prompting_strategy == "cot":
-            # Cerca il summary dopo l'ultimo marcatore
             for marker in ["### Summary:", "Summary:", "In summary,"]:
                 if marker in summary:
                     summary = summary.split(marker)[-1].strip()
                     break
-            # Se non trova nessun marker, prende le ultime 2 frasi
             else:
                 sentences = [s.strip() for s in summary.split(".") if s.strip()]
                 summary = ". ".join(sentences[-2:]) + "."
@@ -261,27 +213,9 @@ class LLMPipeline:
         for i, article in enumerate(texts):
             if i % 50 == 0 and i > 0:
                 logger.info(f"  LLM: {i}/{total} articoli processati")
+            if not isinstance(article, str):
+                logger.warning(f"  Riga {i} ignorata: tipo non valido ({type(article).__name__}: {article!r})")
+                summaries.append("")
+                continue
             summaries.append(self.generate_summary(article))
         return summaries
-
-
-# Test rapido
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    sample_article = (
-        "BACKGROUND: The efficacy of acupuncture for chronic low back pain "
-        "has been controversial. OBJECTIVE: To evaluate the effectiveness of "
-        "acupuncture vs sham acupuncture and no acupuncture for chronic low "
-        "back pain. METHODS: A randomized controlled trial with 638 patients "
-        "was conducted. RESULTS: Acupuncture was significantly more effective "
-        "than no acupuncture, but not more than sham acupuncture. "
-        "CONCLUSIONS: Acupuncture is effective for chronic low back pain, "
-        "but the effect size is small and may be due to placebo."
-    )
-    llm = LLMPipeline(
-        model_name="mistralai/Mixtral-8x7B-Instruct-v0.1",
-        prompting_strategy="few-shot",
-        use_4bit=True,
-    )
-    summary = llm.run(sample_article)
-    print("SUMMARY:", summary)

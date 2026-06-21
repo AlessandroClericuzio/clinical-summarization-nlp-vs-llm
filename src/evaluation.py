@@ -236,8 +236,8 @@ def compute_hallucination_rate(generated_summaries: list[str],
     total_halluc   = 0
 
     for summary, original in zip(generated_summaries, original_texts):
-        summary  = summary.strip()  if summary  else ""
-        original = original.strip() if original else ""
+        summary  = summary.strip()  if isinstance(summary,  str) else ""
+        original = original.strip() if isinstance(original, str) else ""
 
         if not summary:
             rates.append(0.0)
@@ -340,20 +340,15 @@ class Evaluator:
 
         logger.info(f"Evaluator inizializzato su {len(original_texts)} esempi")
 
-    def _extract_entity_sets(self, texts: list[str]) -> list[set]:
-        """
-        Estrae i set di entità mediche per una lista di testi.
-
-        Args:
-            texts: Lista di testi da analizzare
-
-        Returns:
-            Lista di set di testi delle entità
-        """
-        return [
-            self._ner_fn(text).get("entity_texts", set())
-            for text in texts
-        ]
+    def _extract_entity_sets(self, texts):
+        result = []
+        for text in texts:
+            # Guard: skip non-strings (NaN, None, float, etc.)
+            if not isinstance(text, str) or not text.strip():
+                result.append(set())
+                continue
+            result.append(self._ner_fn(text).get("entity_texts", set()))
+        return result
 
     def evaluate(self,
                  predictions: list[str],
