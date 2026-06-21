@@ -1,27 +1,10 @@
-"""
-LLMPipeline.py — Pipeline B: Generative LLM (Abstractive)
-Progetto NLP: Clinical Summarization — NLP Tradizionale vs LLM
-
-Supporta:
-  - Modelli con context window ≥ 32k (Mixtral, Mistral v0.2/v0.3)
-  - Strategie di prompting: zero-shot, few-shot, chain-of-thought (CoT)
-  - Quantizzazione 4-bit per ridurre l'ingombro VRAM
-"""
-
 import logging
 from typing import Optional
-
-import torch
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BitsAndBytesConfig,
-    pipeline,
-)
+import requests
+import json
 
 logger = logging.getLogger(__name__)
 
-# Esempi fissi per few-shot (presi da PubMed per essere in dominio)
 FEW_SHOT_EXAMPLES = [
     {
         "article": (
@@ -60,78 +43,25 @@ FEW_SHOT_EXAMPLES = [
     }
 ]
 
-
 class LLMPipeline:
-    """
-    Pipeline B per generazione astrattiva con LLM.
-
-    Args:
-        model_name: Nome del modello HF (es. 'mistralai/Mixtral-8x7B-Instruct-v0.1')
-        prompting_strategy: 'zero-shot', 'few-shot', 'cot'
-        temperature: temperatura di sampling (bassa per ridurre allucinazioni)
-        max_new_tokens: numero massimo di token generati
-        use_4bit: se True carica il modello in 4-bit (bitsandbytes)
-        device_map: 'auto' per distribuzione automatica
-    """
-
     def __init__(
         self,
-        model_name: str,
+        model_name: str = "gemma4:26b",
         prompting_strategy: str = "few-shot",
         temperature: float = 0.1,
-        max_new_tokens: int = 256,
-        use_4bit: bool = False,
-        device_map: str = "auto",
+        max_new_tokens: int = 2048,
+        ollama_base_url: str = "http://localhost:11434",
     ):
         self.model_name = model_name
         self.prompting_strategy = prompting_strategy
         self.temperature = temperature
         self.max_new_tokens = max_new_tokens
+        self.ollama_base_url = ollama_base_url.rstrip("/")
+        self._generate_url = f"{self.ollama_base_url}/api/chat"
 
-        logger.info(f"Caricamento modello LLM: {model_name}")
-        self._load_model(use_4bit, device_map)
-
-        # Imposta tokenizer per troncamento a sinistra (per mantenere il più possibile il contesto)
-        self.tokenizer.truncation_side = "left"
-        # La context window effettiva dipende dal modello; per Mixtral/Mistral v0.2 è 32768
-        self.max_context_len = min(
-            self.tokenizer.model_max_length,
-            32768  # safe per Mixtral/Mistral v0.2
-        )
-
-    def _load_model(self, use_4bit: bool, device_map: str):
-        """Carica modello e tokenizer con configurazione di quantizzazione."""
-        if use_4bit:
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16,
-            )
-        else:
-            bnb_config = None
-
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.model_name,
-            trust_remote_code=True,
-        )
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_name,
-            device_map=device_map,
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16,
-        )
-        self.model.eval()
-
-        logger.info(f"Modello caricato. Context window: {self.max_context_len}")
+        logger.info(f"LLMPipeline initialized with model: {model_name} via Ollama")
 
     def _build_prompt(self, article: str) -> str:
-        """
-        Costruisce il prompt in base alla strategia selezionata.
-        """
         if self.prompting_strategy == "zero-shot":
             return self._zero_shot_prompt(article)
         elif self.prompting_strategy == "few-shot":
@@ -139,7 +69,7 @@ class LLMPipeline:
         elif self.prompting_strategy == "cot":
             return self._cot_prompt(article)
         else:
-            raise ValueError(f"Strategia non supportata: {self.prompting_strategy}")
+            raise ValueError(f"Unsupported strategy: {self.prompting_strategy}")
 
     def _zero_shot_prompt(self, article: str) -> str:
         return (
@@ -151,7 +81,6 @@ class LLMPipeline:
         )
 
     def _few_shot_prompt(self, article: str) -> str:
-        # Costruiamo il few-shot con gli esempi
         few_shot_text = ""
         for ex in FEW_SHOT_EXAMPLES:
             few_shot_text += (
@@ -181,69 +110,34 @@ class LLMPipeline:
             f"### Summary:\n"
         )
 
-    def _truncate_to_context(self, prompt: str) -> str:
-        """
-        Tronca il prompt a sinistra per rispettare la context window,
-        lasciando spazio per la risposta (max_new_tokens).
-        """
-        # Stimiamo il numero di token del prompt
-        tokens = self.tokenizer.encode(prompt, add_special_tokens=False)
-        max_allowed = self.max_context_len - self.max_new_tokens - 50  # margine di sicurezza
-
-        if len(tokens) <= max_allowed:
-            return prompt
-
-        # Tronca a sinistra mantenendo l'inizio del prompt? Meglio mantenere l'istruzione e l'inizio dell'articolo.
-        # Poiché usiamo truncation_side="left", il tokenizer troncherà a sinistra automaticamente.
-        # Ma per sicurezza, possiamo pre-troncare l'articolo.
-        # Approccio: manteniamo solo la parte finale dell'articolo (ultimi N token)
-        # e reinseriamo il prefisso.
-        # Tuttavia, la tokenizzazione del modello applicherà il troncamento a sinistra.
-        return prompt  # lasceremo che il tokenizer faccia il lavoro
+    def _call_ollama(self, prompt: str) -> str:
+        payload = {
+            "model": self.model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "options": {
+                "temperature": self.temperature,
+                "num_predict": self.max_new_tokens,
+                "top_p": 0.95,
+                "repeat_penalty": 1.15,
+            }
+        }
+        response = requests.post(self._generate_url, json=payload, timeout=300)
+        response.raise_for_status()
+        return response.json().get("message", {}).get("content", "").strip()
 
     def generate_summary(self, article: str) -> str:
-        """Genera un riassunto per un singolo articolo."""
-        if not article or not article.strip():
+        if not isinstance(article, str) or not article.strip():
             return ""
 
         prompt = self._build_prompt(article)
+        summary = self._call_ollama(prompt)
 
-        # Tokenizza con troncamento a sinistra
-        inputs = self.tokenizer(
-            prompt,
-            return_tensors="pt",
-            truncation=True,
-            max_length=self.max_context_len - self.max_new_tokens,
-            padding=False,
-        )
-
-        # Sposta su GPU se necessario
-        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
-
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=self.max_new_tokens,
-                temperature=self.temperature,
-                do_sample=True,
-                top_p=0.95,
-                repetition_penalty=1.15,    
-                pad_token_id=self.tokenizer.eos_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-            )
-
-        # Decodifica saltando il prompt
-        generated = outputs[0][inputs["input_ids"].shape[1]:]
-        summary = self.tokenizer.decode(generated, skip_special_tokens=True)
-
-        # Se la strategia è CoT, estraiamo la parte dopo "### Summary:"
         if self.prompting_strategy == "cot":
-            # Cerca il summary dopo l'ultimo marcatore
             for marker in ["### Summary:", "Summary:", "In summary,"]:
                 if marker in summary:
                     summary = summary.split(marker)[-1].strip()
                     break
-            # Se non trova nessun marker, prende le ultime 2 frasi
             else:
                 sentences = [s.strip() for s in summary.split(".") if s.strip()]
                 summary = ". ".join(sentences[-2:]) + "."
@@ -251,11 +145,9 @@ class LLMPipeline:
         return summary.strip()
 
     def run(self, text: str) -> str:
-        """Interfaccia pubblica per un singolo testo."""
         return self.generate_summary(text)
 
     def run_batch(self, texts: list[str]) -> list[str]:
-        """Esegue su una lista di testi (sequenziale)."""
         summaries = []
         total = len(texts)
         for i, article in enumerate(texts):
@@ -265,7 +157,6 @@ class LLMPipeline:
         return summaries
 
 
-# Test rapido
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     sample_article = (
@@ -279,9 +170,8 @@ if __name__ == "__main__":
         "but the effect size is small and may be due to placebo."
     )
     llm = LLMPipeline(
-        model_name="mistralai/Mixtral-8x7B-Instruct-v0.1",
+        model_name="qwen3.5:27b",
         prompting_strategy="few-shot",
-        use_4bit=True,
     )
     summary = llm.run(sample_article)
     print("SUMMARY:", summary)

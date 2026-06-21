@@ -1,9 +1,3 @@
-"""
-main.py — Orchestratore principale
-Progetto NLP: Clinical Summarization — NLP Tradizionale vs LLM
-Dataset: PubMed Summarization (ccdv/pubmed-summarization)
-"""
-
 import os
 import time
 import argparse
@@ -11,7 +5,6 @@ import logging
 import pandas as pd
 from datasets import load_dataset
 
-from src.NLPPipeline import ClassicalPipeline
 from src.LLMPipeline import LLMPipeline
 from src.evaluation import Evaluator
 
@@ -27,8 +20,8 @@ DEFAULT_DATASET_NAME = "ccdv/pubmed-summarization"
 DEFAULT_SPLIT = "train"               # useremo il train set per il campione
 DEFAULT_SAMPLE_SIZE = 500             # 500 esempi per tempi ragionevoli
 DEFAULT_OUTPUT_DIR = "results/"
-DEFAULT_LLM_MODEL = "qwen3.5:27b"
-DEFAULT_PROMPTING = "one-shot"        # zero-shot, few-shot, cot
+DEFAULT_LLM_MODEL = "gemma4:26b"
+DEFAULT_PROMPTING = "zero-shot"        # zero-shot, few-shot, cot
 DEFAULT_TEMPERATURE = 0.1
 DEFAULT_MAX_NEW_TOKENS = 2048          # aumentato per eguagliare la lunghezza degli abstract
 
@@ -80,7 +73,7 @@ def save_results(df_results: pd.DataFrame, output_dir: str, filename: str) -> st
 def print_summary_table(metrics: dict) -> None:
     separator = "─" * 55
     print(f"\n{'═' * 55}")
-    print(f"  RISULTATI FINALI — CONFRONTO PIPELINE")
+    print(f"  RISULTATI FINALI — PIPELINE LLM")
     print(f"{'═' * 55}")
     for pipeline_name, m in metrics.items():
         print(f"\n  📌 {pipeline_name}")
@@ -109,20 +102,16 @@ def run_pipeline_with_timing(pipeline, texts: list[str], label: str) -> tuple[li
 
 def main(args: argparse.Namespace) -> None:
     # 1. Caricamento dataset
-    # Nel main.py, sostituisci il caricamento con:
     df = load_dataset_from_csv(
         csv_path="data/pubmed_cleaned.csv",
-        sample_size=args.sample_size  # opzionale
+        sample_size=args.sample_size  
     )
     articles   = df["article"].tolist()
     abstracts  = df["abstract"].tolist()
 
-    # 2. Inizializzazione pipeline
-    logger.info("Inizializzazione Pipeline A (Classica — Estrattiva)...")
-    pipeline_a = ClassicalPipeline(n_summary_sentences=3)   # 3 frasi per un riassunto di ~60 parole
-
-    logger.info(f"Inizializzazione Pipeline B (LLM — {args.prompting} prompting)...")
-    pipeline_b = LLMPipeline(
+    # 2. Inizializzazione pipeline LLM
+    logger.info(f"Inizializzazione Pipeline LLM ({args.prompting} prompting)...")
+    pipeline_llm = LLMPipeline(
         model_name=args.llm_model,
         prompting_strategy=args.prompting,
         temperature=args.temperature,
@@ -130,46 +119,36 @@ def main(args: argparse.Namespace) -> None:
     )
 
     # 3. Esecuzione
-    summaries_a, time_a = run_pipeline_with_timing(pipeline_a, articles, "Pipeline A")
-    summaries_b, time_b = run_pipeline_with_timing(pipeline_b, articles, "Pipeline B")
+    summaries_llm, time_llm = run_pipeline_with_timing(pipeline_llm, articles, "Pipeline LLM")
 
     # 4. Valutazione
     logger.info("Calcolo metriche di valutazione...")
     evaluator = Evaluator(original_texts=articles)
 
-    metrics_a = evaluator.evaluate(
-        predictions=summaries_a,
+    metrics_llm = evaluator.evaluate(
+        predictions=summaries_llm,
         references=abstracts,
-        pipeline_label="Pipeline_A_Classical",
-        exec_time_seconds=time_a,
-        compute_hallucinations=False,   # per pipeline A non calcoliamo allucinazioni (non genera nuovo testo)
-    )
-
-    metrics_b = evaluator.evaluate(
-        predictions=summaries_b,
-        references=abstracts,
-        pipeline_label="Pipeline_B_LLM",
-        exec_time_seconds=time_b,
+        pipeline_label="Pipeline_LLM",
+        exec_time_seconds=time_llm,
         compute_hallucinations=True,
     )
 
     # 5. Stampa e salvataggio
     print_summary_table({
-        "Pipeline A — Estrattiva (TextRank)": metrics_a,
-        f"Pipeline B — LLM ({args.prompting})": metrics_b,
+        f"LLM ({args.prompting})": metrics_llm,
     })
 
+    # Salvataggio previsioni
     df_out = df.copy()
-    df_out["summary_classical"] = summaries_a
-    df_out["summary_llm"] = summaries_b
+    df_out["summary_llm"] = summaries_llm
     save_results(df_out, args.output_dir, "predictions.csv")
 
     # Metriche aggregate
     metrics_rows = []
-    for pipeline_name, m in [("Classical", metrics_a), ("LLM", metrics_b)]:
-        row = {"pipeline": pipeline_name}
-        row.update({k: v for k, v in m.items() if not k.endswith("_per_sample")})
-        metrics_rows.append(row)
+    row = {"pipeline": "LLM"}
+    row.update({k: v for k, v in metrics_llm.items() if not k.endswith("_per_sample")})
+    metrics_rows.append(row)
+    
     df_metrics = pd.DataFrame(metrics_rows)
     save_results(df_metrics, args.output_dir, "metrics_summary.csv")
 
@@ -178,7 +157,7 @@ def main(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Clinical Summarization — PubMed dataset"
+        description="Clinical Summarization — PubMed dataset (LLM Only)"
     )
     parser.add_argument("--dataset_name", type=str, default=DEFAULT_DATASET_NAME)
     parser.add_argument("--split", type=str, default=DEFAULT_SPLIT)

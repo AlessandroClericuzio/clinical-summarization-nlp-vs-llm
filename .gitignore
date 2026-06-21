@@ -1,3 +1,11 @@
 data/MeQSum_ACL2019_BenAbacha_Demner-Fushman.xlsx
 
 ObjectOgal.md
+
+venv
+
+src/__pycache__/
+
+notebooks/results/
+
+data/

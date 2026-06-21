@@ -3,4 +3,11 @@ A comparative benchmarking study evaluating traditional NLP pipelines (extractiv
 
 
 Per lanciarlo
+
+sudo apt-get update && sudo apt-get install -y zstd
+
+curl -fsSL https://ollama.com/install.sh | sh
+
+ollama serve
+
 python main.py --dataset_name ccdv/pubmed-summarization --sample_size 500 --llm_model mistralai/Mixtral-8x7B-Instruct-v0.1 --prompting few-shot
