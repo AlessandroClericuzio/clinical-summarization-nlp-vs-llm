@@ -14,7 +14,6 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Esempi fissi per few-shot (presi da PubMed per essere in dominio)
 FEW_SHOT_EXAMPLES = [
     {
         "article": (
@@ -53,7 +52,6 @@ FEW_SHOT_EXAMPLES = [
     }
 ]
 
-
 class LLMPipeline:
     """
     Pipeline B per generazione astrattiva con LLM tramite Ollama.
@@ -68,7 +66,7 @@ class LLMPipeline:
 
     def __init__(
         self,
-        model_name: str,
+        model_name: str = "gemma4:26b",
         prompting_strategy: str = "few-shot",
         temperature: float = 0.1,
         max_new_tokens: int = 4096,
@@ -118,7 +116,7 @@ class LLMPipeline:
         elif self.prompting_strategy == "cot":
             return self._cot_prompt(article)
         else:
-            raise ValueError(f"Strategia non supportata: {self.prompting_strategy}")
+            raise ValueError(f"Unsupported strategy: {self.prompting_strategy}")
 
     def _zero_shot_prompt(self, article: str) -> str:
         return (
@@ -166,6 +164,7 @@ class LLMPipeline:
             return ""
 
         prompt = self._build_prompt(article)
+        summary = self._call_ollama(prompt)
 
         payload = {
             "model": self.model_name,
@@ -203,11 +202,9 @@ class LLMPipeline:
         return summary.strip()
 
     def run(self, text: str) -> str:
-        """Interfaccia pubblica per un singolo testo."""
         return self.generate_summary(text)
 
     def run_batch(self, texts: list[str]) -> list[str]:
-        """Esegue su una lista di testi (sequenziale)."""
         summaries = []
         total = len(texts)
         for i, article in enumerate(texts):
