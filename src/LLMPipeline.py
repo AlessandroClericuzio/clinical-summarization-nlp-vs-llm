@@ -10,6 +10,7 @@ Supporta:
 
 import logging
 import requests
+import re
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -30,7 +31,7 @@ FEW_SHOT_EXAMPLES = [
             "Acupuncture shows small but significant benefit over no treatment "
             "for chronic low back pain, but not over sham acupuncture, suggesting "
             "a possible placebo effect."
-        )
+        ),
     },
     {
         "article": (
@@ -48,9 +49,10 @@ FEW_SHOT_EXAMPLES = [
             "Vitamin D supplementation is associated with a modest reduction "
             "in hip fracture risk in older adults, based on meta-analysis of "
             "11 trials."
-        )
-    }
+        ),
+    },
 ]
+
 
 class LLMPipeline:
     """
@@ -85,7 +87,11 @@ class LLMPipeline:
         logger.info(f"Connessione a Ollama: {self.ollama_host} — modello: {model_name}")
         self._check_ollama()
 
-    def _check_ollama(self):
+    # ------------------------------------------------------------------
+    # Connettività
+    # ------------------------------------------------------------------
+
+    def _check_ollama(self) -> None:
         """Verifica che Ollama sia raggiungibile e che il modello sia disponibile."""
         try:
             resp = requests.get(f"{self.ollama_host}/api/tags", timeout=5)
@@ -107,6 +113,10 @@ class LLMPipeline:
                 "Assicurati che il servizio sia avviato con: ollama serve"
             )
 
+    # ------------------------------------------------------------------
+    # Prompt building
+    # ------------------------------------------------------------------
+
     def _build_prompt(self, article: str) -> str:
         """Costruisce il prompt in base alla strategia selezionata."""
         if self.prompting_strategy == "zero-shot":
@@ -120,11 +130,13 @@ class LLMPipeline:
 
     def _zero_shot_prompt(self, article: str) -> str:
         return (
-            f"### Instruction:\n"
-            f"Read the following medical article and write a concise, abstractive summary "
-            f"in one or two sentences. Capture the main findings and conclusions.\n\n"
+            "### Instruction:\n"
+            "Read the following medical article and write a concise, abstractive summary "
+            "in one or two sentences. Capture the main findings and conclusions.\n"
+            "IMPORTANT: Output ONLY the requested summary. Do not include any conversational filler, "
+            "introductions, or explanations (e.g., do NOT write 'Here is the summary:').\n\n"
             f"### Article:\n{article}\n\n"
-            f"### Summary:\n"
+            "### Summary:\n"
         )
 
     def _few_shot_prompt(self, article: str) -> str:
@@ -135,37 +147,40 @@ class LLMPipeline:
                 f"### Summary:\n{ex['summary']}\n\n"
             )
         return (
-            f"### Instruction:\n"
-            f"Read the following medical article and write a concise, abstractive summary "
-            f"in one or two sentences. Capture the main findings and conclusions.\n\n"
-            f"Here are some examples:\n\n"
+            "### Instruction:\n"
+            "Read the following medical article and write a concise, abstractive summary "
+            "in one or two sentences. Capture the main findings and conclusions.\n"
+            "IMPORTANT: Output ONLY the requested summary. Do not include any conversational filler, "
+            "introductions, or explanations.\n\n"
+            "Here are some examples of the exact format required:\n\n"
             f"{few_shot_text}"
             f"### Article:\n{article}\n\n"
-            f"### Summary:\n"
+            "### Summary:\n"
         )
 
     def _cot_prompt(self, article: str) -> str:
         return (
-            f"### Instruction:\n"
-            f"Read the following medical article and provide a step-by-step reasoning "
-            f"about the most important points, then produce a concise abstractive summary.\n\n"
+            "### Instruction:\n"
+            "Read the following medical article and provide a step-by-step reasoning "
+            "about the most important points, then produce a concise abstractive summary.\n"
+            "IMPORTANT: You MUST format your response exactly as shown below. "
+            "End your reasoning strictly with the word '### Summary:' on a new line, "
+            "followed ONLY by the final summary text and nothing else.\n\n"
             f"### Article:\n{article}\n\n"
-            f"### Chain of Thought:\n"
-            f"1. The main objective of the study is ...\n"
-            f"2. The key findings are ...\n"
-            f"3. The conclusion is ...\n"
-            f"### Summary:\n"
+            "### Chain of Thought:\n"
+            "1. The main objective of the study is ...\n"
+            "2. The key findings are ...\n"
+            "3. The conclusion is ...\n"
+            "### Summary:\n"
+            "[Insert final summary here without any filler text]\n"
         )
 
-    def generate_summary(self, article: str) -> str:
-        """Genera un riassunto per un singolo articolo tramite Ollama."""
-        # Gestisce NaN (float) o qualsiasi valore non-stringa
-        if not isinstance(article, str) or not article.strip():
-            return ""
+    # ------------------------------------------------------------------
+    # Ollama call
+    # ------------------------------------------------------------------
 
-        prompt = self._build_prompt(article)
-        summary = self._call_ollama(prompt)
-
+    def _call_ollama(self, prompt: str) -> str:
+        """Invia il prompt a Ollama e restituisce il testo generato."""
         payload = {
             "model": self.model_name,
             "prompt": prompt,
@@ -177,11 +192,10 @@ class LLMPipeline:
                 "repeat_penalty": 1.15,
             },
         }
-
         try:
             resp = requests.post(self.api_url, json=payload, timeout=120)
             resp.raise_for_status()
-            summary = resp.json().get("response", "").strip()
+            return resp.json().get("response", "").strip()
         except requests.exceptions.Timeout:
             logger.error("Timeout nella richiesta a Ollama.")
             return ""
@@ -189,17 +203,65 @@ class LLMPipeline:
             logger.error(f"Errore nella richiesta a Ollama: {e}")
             return ""
 
-        # Se la strategia è CoT, estraiamo la parte dopo "### Summary:"
+    # ------------------------------------------------------------------
+    # Summarization & Post-Processing
+    # ------------------------------------------------------------------
+
+    def _clean_chatty_output(self, text: str) -> str:
+        """Rimuove i classici pattern discorsivi introdotti dai modelli instruction-tuned."""
+        chatty_patterns = [
+            r"^(Sure|Yes|Okay)[\w\s\,]*[\.\!\:]",
+            r"^Here\s+(is|are)\s+(a|the)\s+[\w\s]*summary[\w\s]*\:",
+            r"^(The\s+)?(Brief\s+)?Summary\s*(\(Abstractive\))?\s*\:",
+            r"^In summary\,?\s*",
+            r"^To summarize\,?\s*",
+        ]
+        
+        cleaned_text = text
+        for pattern in chatty_patterns:
+            cleaned_text = re.sub(pattern, "", cleaned_text, flags=re.IGNORECASE).strip()
+            
+        # Rimuove le virgolette iniziali/finali se il modello le ha inserite
+        if cleaned_text.startswith('"') and cleaned_text.endswith('"'):
+            cleaned_text = cleaned_text[1:-1].strip()
+            
+        return cleaned_text
+
+    def generate_summary(self, article: str) -> str:
+        """Genera un riassunto per un singolo articolo tramite Ollama."""
+        # Gestisce NaN (float) o qualsiasi valore non-stringa
+        if not isinstance(article, str) or not article.strip():
+            return ""
+
+        prompt = self._build_prompt(article)
+        summary = self._call_ollama(prompt)
+
+        if not summary:
+            return ""
+
+        # Estrazione strutturata
         if self.prompting_strategy == "cot":
+            # Estraiamo la parte dopo "### Summary:" o marcatori simili
             for marker in ["### Summary:", "Summary:", "In summary,"]:
                 if marker in summary:
                     summary = summary.split(marker)[-1].strip()
                     break
             else:
+                # Fallback estremo: ultime 2 frasi
                 sentences = [s.strip() for s in summary.split(".") if s.strip()]
                 summary = ". ".join(sentences[-2:]) + "."
+        else:
+            # Rimuove "### Summary:" se il modello dovesse generarlo da solo nell'output
+            summary = summary.replace("### Summary:", "").strip()
+
+        # Pulizia da frasi colloquiali
+        summary = self._clean_chatty_output(summary)
 
         return summary.strip()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def run(self, text: str) -> str:
         return self.generate_summary(text)
@@ -211,7 +273,10 @@ class LLMPipeline:
             if i % 50 == 0 and i > 0:
                 logger.info(f"  LLM: {i}/{total} articoli processati")
             if not isinstance(article, str):
-                logger.warning(f"  Riga {i} ignorata: tipo non valido ({type(article).__name__}: {article!r})")
+                logger.warning(
+                    f"  Riga {i} ignorata: tipo non valido "
+                    f"({type(article).__name__}: {article!r})"
+                )
                 summaries.append("")
                 continue
             summaries.append(self.generate_summary(article))
