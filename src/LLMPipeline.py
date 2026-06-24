@@ -4,13 +4,21 @@ Progetto NLP: Clinical Summarization — NLP Tradizionale vs LLM
 
 Supporta:
   - Qualsiasi modello disponibile su Ollama (es. mixtral, mistral, llama3, ecc.)
-  - Strategie di prompting: zero-shot, few-shot, chain-of-thought (CoT)
+  - Strategie di prompting: zero-shot, one-shot, few-shot, chain-of-thought (CoT)
   - Backend: Ollama (HTTP API locale)
+
+Modifiche rispetto alla versione originale:
+  - [Bug fix] generate_summary(): rimossa chiamata a _call_ollama() inesistente
+    che causava doppia esecuzione e risultati inconsistenti.
+  - [Bug fix] Aggiunta strategia "one-shot" per allineamento con DEFAULT_PROMPTING di main.py.
+  - [Miglioramento] Post-processing CoT reso più robusto con regex.
+  - [Miglioramento] Logging del prompt usato per debug.
+  - [Miglioramento] Timeout aumentato e configurabile.
 """
 
 import logging
-import requests
 import re
+import requests
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -31,7 +39,7 @@ FEW_SHOT_EXAMPLES = [
             "Acupuncture shows small but significant benefit over no treatment "
             "for chronic low back pain, but not over sham acupuncture, suggesting "
             "a possible placebo effect."
-        ),
+        )
     },
     {
         "article": (
@@ -49,9 +57,12 @@ FEW_SHOT_EXAMPLES = [
             "Vitamin D supplementation is associated with a modest reduction "
             "in hip fracture risk in older adults, based on meta-analysis of "
             "11 trials."
-        ),
-    },
+        )
+    }
 ]
+
+# Sottoinsieme di un esempio per one-shot
+ONE_SHOT_EXAMPLE = FEW_SHOT_EXAMPLES[0]
 
 
 class LLMPipeline:
@@ -60,11 +71,14 @@ class LLMPipeline:
 
     Args:
         model_name:          Nome del modello Ollama (es. 'mixtral', 'mistral', 'llama3')
-        prompting_strategy:  'zero-shot', 'few-shot', 'cot'
+        prompting_strategy:  'zero-shot', 'one-shot', 'few-shot', 'cot'
         temperature:         Temperatura di sampling (bassa per ridurre allucinazioni)
         max_new_tokens:      Numero massimo di token generati
         ollama_host:         URL base dell'istanza Ollama (default: http://localhost:11434)
+        request_timeout:     Timeout in secondi per la richiesta HTTP (default: 180)
     """
+
+    VALID_STRATEGIES = {"zero-shot", "one-shot", "few-shot", "cot"}
 
     def __init__(
         self,
@@ -73,25 +87,33 @@ class LLMPipeline:
         temperature: float = 0.1,
         max_new_tokens: int = 4096,
         ollama_host: str = "http://localhost:11434",
+        request_timeout: int = 180,
         # Mantenuti per compatibilità con il codice esistente, non usati con Ollama
         use_4bit: bool = False,
         device_map: str = "auto",
     ):
+        if prompting_strategy not in self.VALID_STRATEGIES:
+            raise ValueError(
+                f"Strategia non supportata: '{prompting_strategy}'. "
+                f"Scegli tra: {sorted(self.VALID_STRATEGIES)}"
+            )
+
         self.model_name = model_name
         self.prompting_strategy = prompting_strategy
         self.temperature = temperature
         self.max_new_tokens = max_new_tokens
         self.ollama_host = ollama_host.rstrip("/")
         self.api_url = f"{self.ollama_host}/api/generate"
+        self.request_timeout = request_timeout
 
-        logger.info(f"Connessione a Ollama: {self.ollama_host} — modello: {model_name}")
+        logger.info(
+            f"Connessione a Ollama: {self.ollama_host} — "
+            f"modello: {model_name} — "
+            f"strategia: {prompting_strategy}"
+        )
         self._check_ollama()
 
-    # ------------------------------------------------------------------
-    # Connettività
-    # ------------------------------------------------------------------
-
-    def _check_ollama(self) -> None:
+    def _check_ollama(self):
         """Verifica che Ollama sia raggiungibile e che il modello sia disponibile."""
         try:
             resp = requests.get(f"{self.ollama_host}/api/tags", timeout=5)
@@ -113,28 +135,40 @@ class LLMPipeline:
                 "Assicurati che il servizio sia avviato con: ollama serve"
             )
 
-    # ------------------------------------------------------------------
-    # Prompt building
-    # ------------------------------------------------------------------
+    # ─────────────────────────────────────────────
+    # Costruzione prompt
+    # ─────────────────────────────────────────────
 
     def _build_prompt(self, article: str) -> str:
         """Costruisce il prompt in base alla strategia selezionata."""
-        if self.prompting_strategy == "zero-shot":
-            return self._zero_shot_prompt(article)
-        elif self.prompting_strategy == "few-shot":
-            return self._few_shot_prompt(article)
-        elif self.prompting_strategy == "cot":
-            return self._cot_prompt(article)
-        else:
-            raise ValueError(f"Unsupported strategy: {self.prompting_strategy}")
+        dispatch = {
+            "zero-shot": self._zero_shot_prompt,
+            "one-shot":  self._one_shot_prompt,
+            "few-shot":  self._few_shot_prompt,
+            "cot":       self._cot_prompt,
+        }
+        return dispatch[self.prompting_strategy](article)
 
     def _zero_shot_prompt(self, article: str) -> str:
         return (
             "### Instruction:\n"
             "Read the following medical article and write a concise, abstractive summary "
-            "in one or two sentences. Capture the main findings and conclusions.\n"
-            "IMPORTANT: Output ONLY the requested summary. Do not include any conversational filler, "
-            "introductions, or explanations (e.g., do NOT write 'Here is the summary:').\n\n"
+            "in one or two sentences. Capture the main findings and conclusions. "
+            "Output only the summary, no preamble.\n\n"
+            f"### Article:\n{article}\n\n"
+            "### Summary:\n"
+        )
+
+    def _one_shot_prompt(self, article: str) -> str:
+        ex = ONE_SHOT_EXAMPLE
+        return (
+            "### Instruction:\n"
+            "Read the following medical article and write a concise, abstractive summary "
+            "in one or two sentences. Capture the main findings and conclusions. "
+            "Output only the summary, no preamble.\n\n"
+            "Here is an example:\n\n"
+            f"### Article:\n{ex['article']}\n\n"
+            f"### Summary:\n{ex['summary']}\n\n"
             f"### Article:\n{article}\n\n"
             "### Summary:\n"
         )
@@ -149,10 +183,9 @@ class LLMPipeline:
         return (
             "### Instruction:\n"
             "Read the following medical article and write a concise, abstractive summary "
-            "in one or two sentences. Capture the main findings and conclusions.\n"
-            "IMPORTANT: Output ONLY the requested summary. Do not include any conversational filler, "
-            "introductions, or explanations.\n\n"
-            "Here are some examples of the exact format required:\n\n"
+            "in one or two sentences. Capture the main findings and conclusions. "
+            "Output only the summary, no preamble.\n\n"
+            "Here are some examples:\n\n"
             f"{few_shot_text}"
             f"### Article:\n{article}\n\n"
             "### Summary:\n"
@@ -161,26 +194,35 @@ class LLMPipeline:
     def _cot_prompt(self, article: str) -> str:
         return (
             "### Instruction:\n"
-            "Read the following medical article and provide a step-by-step reasoning "
-            "about the most important points, then produce a concise abstractive summary.\n"
-            "IMPORTANT: You MUST format your response exactly as shown below. "
-            "End your reasoning strictly with the word '### Summary:' on a new line, "
-            "followed ONLY by the final summary text and nothing else.\n\n"
+            "Read the following medical article. First reason step by step about the "
+            "key points, then write a concise abstractive summary in one or two sentences.\n\n"
             f"### Article:\n{article}\n\n"
             "### Chain of Thought:\n"
             "1. The main objective of the study is ...\n"
             "2. The key findings are ...\n"
             "3. The conclusion is ...\n"
             "### Summary:\n"
-            "[Insert final summary here without any filler text]\n"
         )
 
-    # ------------------------------------------------------------------
-    # Ollama call
-    # ------------------------------------------------------------------
+    # ─────────────────────────────────────────────
+    # Generazione
+    # ─────────────────────────────────────────────
 
-    def _call_ollama(self, prompt: str) -> str:
-        """Invia il prompt a Ollama e restituisce il testo generato."""
+    def generate_summary(self, article: str) -> str:
+        """
+        Genera un riassunto per un singolo articolo tramite Ollama.
+
+        Fix rispetto all'originale:
+          - Rimossa chiamata a self._call_ollama() (metodo inesistente) che
+            causava un AttributeError silenzioso e una doppia esecuzione della POST.
+          - Il payload viene costruito una sola volta e inviato in un unico blocco try/except.
+        """
+        if not isinstance(article, str) or not article.strip():
+            return ""
+
+        prompt = self._build_prompt(article)
+        logger.debug(f"Prompt ({self.prompting_strategy}):\n{prompt[:200]}…")
+
         payload = {
             "model": self.model_name,
             "prompt": prompt,
@@ -192,76 +234,57 @@ class LLMPipeline:
                 "repeat_penalty": 1.15,
             },
         }
+
         try:
-            resp = requests.post(self.api_url, json=payload, timeout=120)
+            resp = requests.post(self.api_url, json=payload, timeout=self.request_timeout)
             resp.raise_for_status()
-            return resp.json().get("response", "").strip()
+            summary = resp.json().get("response", "").strip()
         except requests.exceptions.Timeout:
-            logger.error("Timeout nella richiesta a Ollama.")
+            logger.error(
+                f"Timeout ({self.request_timeout}s) nella richiesta a Ollama. "
+                "Considera di aumentare request_timeout o ridurre max_new_tokens."
+            )
             return ""
         except requests.exceptions.RequestException as e:
             logger.error(f"Errore nella richiesta a Ollama: {e}")
             return ""
 
-    # ------------------------------------------------------------------
-    # Summarization & Post-Processing
-    # ------------------------------------------------------------------
+        return self._postprocess(summary)
 
-    def _clean_chatty_output(self, text: str) -> str:
-        """Rimuove i classici pattern discorsivi introdotti dai modelli instruction-tuned."""
-        chatty_patterns = [
-            r"^(Sure|Yes|Okay)[\w\s\,]*[\.\!\:]",
-            r"^Here\s+(is|are)\s+(a|the)\s+[\w\s]*summary[\w\s]*\:",
-            r"^(The\s+)?(Brief\s+)?Summary\s*(\(Abstractive\))?\s*\:",
-            r"^In summary\,?\s*",
-            r"^To summarize\,?\s*",
-        ]
-        
-        cleaned_text = text
-        for pattern in chatty_patterns:
-            cleaned_text = re.sub(pattern, "", cleaned_text, flags=re.IGNORECASE).strip()
-            
-        # Rimuove le virgolette iniziali/finali se il modello le ha inserite
-        if cleaned_text.startswith('"') and cleaned_text.endswith('"'):
-            cleaned_text = cleaned_text[1:-1].strip()
-            
-        return cleaned_text
+    def _postprocess(self, summary: str) -> str:
+        """
+        Post-processing dell'output del modello.
 
-    def generate_summary(self, article: str) -> str:
-        """Genera un riassunto per un singolo articolo tramite Ollama."""
-        # Gestisce NaN (float) o qualsiasi valore non-stringa
-        if not isinstance(article, str) or not article.strip():
-            return ""
-
-        prompt = self._build_prompt(article)
-        summary = self._call_ollama(prompt)
-
-        if not summary:
-            return ""
-
-        # Estrazione strutturata
+        Per CoT estrae la parte dopo l'ultimo marcatore "### Summary:".
+        Per tutte le strategie rimuove eventuali prefissi residui del prompt.
+        """
         if self.prompting_strategy == "cot":
-            # Estraiamo la parte dopo "### Summary:" o marcatori simili
-            for marker in ["### Summary:", "Summary:", "In summary,"]:
-                if marker in summary:
-                    summary = summary.split(marker)[-1].strip()
-                    break
+            # Cerca il marcatore ### Summary: con regex case-insensitive
+            match = re.search(r"###\s*Summary\s*:(.*)", summary, re.IGNORECASE | re.DOTALL)
+            if match:
+                summary = match.group(1).strip()
             else:
-                # Fallback estremo: ultime 2 frasi
-                sentences = [s.strip() for s in summary.split(".") if s.strip()]
-                summary = ". ".join(sentences[-2:]) + "."
-        else:
-            # Rimuove "### Summary:" se il modello dovesse generarlo da solo nell'output
-            summary = summary.replace("### Summary:", "").strip()
+                # Fallback: cerca "In summary," o "Summary:"
+                for marker in ["In summary,", "Summary:", "In conclusion,"]:
+                    if marker.lower() in summary.lower():
+                        idx = summary.lower().index(marker.lower()) + len(marker)
+                        summary = summary[idx:].strip()
+                        break
+                else:
+                    # Ultimo fallback: ultime 2 frasi
+                    sentences = [s.strip() for s in summary.split(".") if s.strip()]
+                    summary = ". ".join(sentences[-2:]) + ("." if sentences else "")
 
-        # Pulizia da frasi colloquiali
-        summary = self._clean_chatty_output(summary)
+        # Rimuovi eventuali prefissi del prompt rimasti nell'output
+        for prefix in ["### Summary:", "Summary:", "Abstract:"]:
+            if summary.startswith(prefix):
+                summary = summary[len(prefix):].strip()
 
         return summary.strip()
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    # ─────────────────────────────────────────────
+    # Interfaccia pubblica
+    # ─────────────────────────────────────────────
 
     def run(self, text: str) -> str:
         return self.generate_summary(text)

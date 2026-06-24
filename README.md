@@ -7,8 +7,7 @@ sudo apt-get update && sudo apt-get install -y zstd
 
 curl -fsSL https://ollama.com/install.sh | sh
 
-
 ollama serve
 
 Per lanciarlo
-python main.py --dataset_name ccdv/pubmed-summarization --sample_size 5 --llm_model gemma4:26b --prompting few-shot
+python main.py --dataset_name ccdv/pubmed-summarization --sample_size 500 --llm_model llama3.1:8b --prompting zero-shot
