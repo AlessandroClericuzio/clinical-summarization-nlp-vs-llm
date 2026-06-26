@@ -10,6 +10,7 @@ Modifiche rispetto alla versione originale:
     il bias posizionale di Pipeline A da linea di comando.
   - [Miglioramento] Inizializzazione ClassicalPipeline aggiornata per passare
     position_bias_weight.
+  - [Nuovo] Salvataggio dinamico dei risultati includendo la strategia di prompting nel nome del file.
 """
 
 import os
@@ -87,20 +88,20 @@ def save_results(df_results: pd.DataFrame, output_dir: str, filename: str) -> st
 def print_summary_table(metrics: dict) -> None:
     separator = "─" * 55
     print(f"\n{'═' * 55}")
-    print(f"  RISULTATI FINALI — CONFRONTO PIPELINE")
+    print(f"   RISULTATI FINALI — CONFRONTO PIPELINE")
     print(f"{'═' * 55}")
     for pipeline_name, m in metrics.items():
         print(f"\n  {pipeline_name}")
         print(separator)
-        print(f"  {'Metrica':<30} {'Valore':>10}")
+        print(f"   {'Metrica':<30} {'Valore':>10}")
         print(separator)
         for key, val in m.items():
             if key.endswith("_per_sample"):
                 continue
             if isinstance(val, float):
-                print(f"  {key:<30} {val:>10.4f}")
+                print(f"   {key:<30} {val:>10.4f}")
             else:
-                print(f"  {key:<30} {str(val):>10}")
+                print(f"   {key:<30} {str(val):>10}")
     print(f"\n{'═' * 55}\n")
 
 
@@ -181,7 +182,11 @@ def main(args: argparse.Namespace) -> None:
     df_out = df.copy()
     df_out["summary_classical"] = summaries_a
     df_out["summary_llm"] = summaries_b
-    save_results(df_out, args.output_dir, "predictions.csv")
+    
+    predictions_filename = f"predictions_{args.prompting}.csv"
+    metrics_filename = f"metrics_summary_{args.prompting}.csv"
+    
+    save_results(df_out, args.output_dir, predictions_filename)
 
     metrics_rows = []
     for pipeline_name, m in [("Classical", metrics_a), ("LLM", metrics_b)]:
@@ -189,7 +194,7 @@ def main(args: argparse.Namespace) -> None:
         row.update({k: v for k, v in m.items() if not k.endswith("_per_sample")})
         metrics_rows.append(row)
     df_metrics = pd.DataFrame(metrics_rows)
-    save_results(df_metrics, args.output_dir, "metrics_summary.csv")
+    save_results(df_metrics, args.output_dir, metrics_filename)
 
     logger.info("Esecuzione completata.")
 

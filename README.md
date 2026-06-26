@@ -11,3 +11,7 @@ ollama serve
 
 Per lanciarlo
 python main.py --dataset_name ccdv/pubmed-summarization --sample_size 500 --llm_model llama3.1:8b --prompting zero-shot
+
+python main.py --dataset_name ccdv/pubmed-summarization --sample_size 500 --llm_model llama3.1:8b --prompting one-shot
+
+python main.py --dataset_name ccdv/pubmed-summarization --sample_size 500 --llm_model llama3.1:8b --prompting few-shot
