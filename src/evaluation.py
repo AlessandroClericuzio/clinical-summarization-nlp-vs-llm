@@ -39,6 +39,7 @@ import numpy as np
 from rouge_score import rouge_scorer
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from bert_score import score as bert_score_fn
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +115,72 @@ def compute_rouge(predictions: list[str], references: list[str]) -> dict:
         results[f"{rt}_per_sample"] = per_sample[rt]
 
     return results
+# ─────────────────────────────────────────────
+# 1b. BERTScore
+# ─────────────────────────────────────────────
+
+def compute_bertscore(predictions: list[str],
+                      references: list[str],
+                      model_type: str = "dmis-lab/biobert-base-cased-v1.2") -> dict:
+    """
+    Calcola BERTScore tra predizioni e Ground Truth.
+
+    BERTScore misura la similarità semantica tra testo generato e riferimento
+    usando embeddings contestuali di un modello BERT. A differenza di ROUGE,
+    cattura la similarità semantica anche in assenza di overlap lessicale diretto.
+
+    Usiamo BioBERT come modello base perché pre-addestrato su testi biomedici,
+    producendo embeddings più accurati per il dominio PubMed rispetto a BERT standard.
+
+    Args:
+        predictions: Lista di sintesi generate dalla pipeline
+        references:  Lista di abstract (Ground Truth)
+        model_type:  Modello BERT da usare per gli embeddings
+                     Default: BioBERT (biomedico) — alternativa: 'bert-base-uncased'
+
+    Returns:
+        Dizionario con precision, recall e F1 medi e per campione
+    """
+    # Filtra coppie con stringhe vuote — BERTScore va in errore su input vuoti
+    valid_preds, valid_refs, valid_indices = [], [], []
+    for i, (pred, ref) in enumerate(zip(predictions, references)):
+        if pred and pred.strip() and ref and ref.strip():
+            valid_preds.append(pred.strip())
+            valid_refs.append(ref.strip())
+            valid_indices.append(i)
+
+    n = len(predictions)
+    precision_scores = [0.0] * n
+    recall_scores    = [0.0] * n
+    f1_scores        = [0.0] * n
+
+    if valid_preds:
+        try:
+            P, R, F1 = bert_score_fn(
+                valid_preds,
+                valid_refs,
+                model_type=model_type,
+                lang="en",
+                verbose=False,
+                device=None,   # usa GPU se disponibile, altrimenti CPU
+            )
+            for list_pos, orig_idx in enumerate(valid_indices):
+                precision_scores[orig_idx] = float(P[list_pos])
+                recall_scores[orig_idx]    = float(R[list_pos])
+                f1_scores[orig_idx]        = float(F1[list_pos])
+
+        except Exception as e:
+            logger.error(f"Errore nel calcolo BERTScore: {e}. "
+                         "Verifica che 'bert-score' sia installato: pip install bert-score")
+
+    return {
+        "bertscore_precision":            float(np.mean(precision_scores)),
+        "bertscore_recall":               float(np.mean(recall_scores)),
+        "bertscore_f1":                   float(np.mean(f1_scores)),
+        "bertscore_precision_per_sample": precision_scores,
+        "bertscore_recall_per_sample":    recall_scores,
+        "bertscore_f1_per_sample":        f1_scores,
+    }
 
 
 # ─────────────────────────────────────────────
@@ -426,6 +493,11 @@ class Evaluator:
         rouge_metrics = compute_rouge(predictions, references)
         results.update(rouge_metrics)
 
+        # ── BERTScore (vs ground truth abstract) ───────────────────────
+        logger.info(f"[{pipeline_label}] Calcolo BERTScore (BioBERT)...")
+        bertscore_metrics = compute_bertscore(predictions, references)
+        results.update(bertscore_metrics)
+
         # ── NER F1 (vs articolo originale) ─────────────────────────────
         # NOTA: il riferimento NER è ora original_texts (articolo), non references
         # (abstract ground truth). Questo misura la fedeltà alla fonte, non la
@@ -460,6 +532,7 @@ class Evaluator:
             f"[{pipeline_label}] "
             f"ROUGE-1={results['rouge1']:.4f} | "
             f"ROUGE-L={results['rougeL']:.4f} | "
+            f"BERTScore-F1={results['bertscore_f1']:.4f} | "
             f"NER-F1={results['ner_f1']:.4f} | "
             f"Halluc={results['hallucination_rate']:.4f} | "
             f"{results['ms_per_example']:.1f} ms/ex"
@@ -478,6 +551,7 @@ class Evaluator:
             "rouge1":             "higher_is_better",
             "rouge2":             "higher_is_better",
             "rougeL":             "higher_is_better",
+            "bertscore_f1":       "higher_is_better", 
             "ner_f1":             "higher_is_better",
             "hallucination_rate": "lower_is_better",
             "ms_per_example":     "lower_is_better",
