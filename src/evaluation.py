@@ -121,7 +121,7 @@ def compute_rouge(predictions: list[str], references: list[str]) -> dict:
 
 def compute_bertscore(predictions: list[str],
                       references: list[str],
-                      model_type: str = "dmis-lab/biobert-base-cased-v1.2") -> dict:
+                      model_type: str = "bert-base-uncased") -> dict:
     """
     Calcola BERTScore tra predizioni e Ground Truth.
 
@@ -129,14 +129,28 @@ def compute_bertscore(predictions: list[str],
     usando embeddings contestuali di un modello BERT. A differenza di ROUGE,
     cattura la similarità semantica anche in assenza di overlap lessicale diretto.
 
-    Usiamo BioBERT come modello base perché pre-addestrato su testi biomedici,
-    producendo embeddings più accurati per il dominio PubMed rispetto a BERT standard.
+    Usiamo BERT standard (non BioBERT) perché è nella whitelist interna di
+    bert-score con baseline precalcolata per il rescaling. Il rescale
+    ("stira" la scala sottraendo la similarità media tra frasi casuali
+    scorrelate) rende i punteggi molto più discriminanti: senza rescale,
+    anche frasi semanticamente scorrelate ottengono cosine similarity alta
+    (~0.80-0.85) per come è strutturato lo spazio degli embedding contestuali,
+    schiacciando tutti i punteggi in un range stretto e poco informativo.
+    BioBERT, essendo fuori whitelist, non avrebbe questa baseline disponibile
+    (oltre ad avere richiesto un workaround num_layers e aver causato problemi
+    di compatibilità con versioni recenti di transformers/tokenizers).
+
+    Per il confronto Pipeline A (estrattiva) vs B (LLM/astrattiva) contro
+    l'abstract umano, ci interessa la similarità semantica generale tra frasi
+    in inglese — non terminologia medica specialistica — quindi un BERT
+    generalista è la scelta più appropriata e comparabile con la letteratura
+    (Zhang et al. 2020).
 
     Args:
         predictions: Lista di sintesi generate dalla pipeline
         references:  Lista di abstract (Ground Truth)
         model_type:  Modello BERT da usare per gli embeddings
-                     Default: BioBERT (biomedico) — alternativa: 'bert-base-uncased'
+                     Default: bert-base-uncased (con baseline rescaling)
 
     Returns:
         Dizionario con precision, recall e F1 medi e per campione
@@ -162,7 +176,8 @@ def compute_bertscore(predictions: list[str],
                 model_type=model_type,
                 lang="en",
                 verbose=False,
-                device=None,   # usa GPU se disponibile, altrimenti CPU
+                device=None,                  # usa GPU se disponibile, altrimenti CPU
+                rescale_with_baseline=True,    # vedi docstring: rende i punteggi discriminanti
             )
             for list_pos, orig_idx in enumerate(valid_indices):
                 precision_scores[orig_idx] = float(P[list_pos])
@@ -172,6 +187,8 @@ def compute_bertscore(predictions: list[str],
         except Exception as e:
             logger.error(f"Errore nel calcolo BERTScore: {e}. "
                          "Verifica che 'bert-score' sia installato: pip install bert-score")
+            import traceback
+            logger.error(traceback.format_exc())
 
     return {
         "bertscore_precision":            float(np.mean(precision_scores)),

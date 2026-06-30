@@ -23,47 +23,23 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-FEW_SHOT_EXAMPLES = [
-    {
-        "article": (
-            "BACKGROUND: The efficacy of acupuncture for chronic low back pain "
-            "has been controversial. OBJECTIVE: To evaluate the effectiveness of "
-            "acupuncture vs sham acupuncture and no acupuncture for chronic low "
-            "back pain. METHODS: A randomized controlled trial with 638 patients "
-            "was conducted. RESULTS: Acupuncture was significantly more effective "
-            "than no acupuncture, but not more than sham acupuncture. "
-            "CONCLUSIONS: Acupuncture is effective for chronic low back pain, "
-            "but the effect size is small and may be due to placebo."
-        ),
-        "summary": (
-            "Acupuncture shows small but significant benefit over no treatment "
-            "for chronic low back pain, but not over sham acupuncture, suggesting "
-            "a possible placebo effect."
-        )
-    },
-    {
-        "article": (
-            "BACKGROUND: The role of vitamin D supplementation in preventing "
-            "fractures is unclear. OBJECTIVE: To determine whether vitamin D "
-            "supplementation reduces the risk of fractures in older adults. "
-            "METHODS: We conducted a meta-analysis of 11 randomized controlled "
-            "trials involving 31,022 participants. RESULTS: Vitamin D "
-            "supplementation was associated with a 10% reduction in the risk "
-            "of hip fractures (RR 0.90, 95% CI 0.83-0.98). CONCLUSIONS: "
-            "Vitamin D supplementation may reduce the risk of hip fractures in "
-            "older adults, but the benefit is modest."
-        ),
-        "summary": (
-            "Vitamin D supplementation is associated with a modest reduction "
-            "in hip fracture risk in older adults, based on meta-analysis of "
-            "11 trials."
-        )
-    }
-]
+def _load_real_examples(n: int = 2) -> list[dict]:
+    """
+    Carica n esempi reali dal dataset PubMed con indici fissi.
+    Indici scelti lontani dal campione di test (random_state=42).
+    """
+    from datasets import load_dataset
+    ds = load_dataset("ccdv/pubmed-summarization", split="train")
+    fixed_indices = [10000, 10001, 10002][:n]
+    return [
+        {"article": ds[i]["article"], "abstract": ds[i]["abstract"]}
+        for i in fixed_indices
+    ]
 
-# Sottoinsieme di un esempio per one-shot
-ONE_SHOT_EXAMPLE = FEW_SHOT_EXAMPLES[0]
-
+# Caricati una sola volta a livello di modulo
+_REAL_EXAMPLES = _load_real_examples(n=2)
+ONE_SHOT_EXAMPLE  = _REAL_EXAMPLES[:1]
+FEW_SHOT_EXAMPLES = _REAL_EXAMPLES[:2]
 
 class LLMPipeline:
     """
@@ -79,7 +55,18 @@ class LLMPipeline:
     """
 
     VALID_STRATEGIES = {"zero-shot", "one-shot", "few-shot", "cot"}
-
+    # Istruzione comune a tutti i prompt
+    _TASK_INSTRUCTION = (
+        "You are a biomedical expert specialized in summarizing scientific articles.\n"
+        "Your task is to produce a concise, faithful, and abstractive summary "
+        "of a biomedical research article.\n\n"
+        "Rules:\n"
+        "- Write 2 to 4 sentences.\n"
+        "- Cover: main objective, key findings, and conclusion.\n"
+        "- Use only information explicitly present in the article.\n"
+        "- Do not add interpretations, opinions, or external knowledge.\n"
+        "- Output only the summary, with no preamble or label.\n"
+    )
     def __init__(
         self,
         model_name: str = "gemma4:26b",
@@ -149,58 +136,53 @@ class LLMPipeline:
         }
         return dispatch[self.prompting_strategy](article)
 
+
+
     def _zero_shot_prompt(self, article: str) -> str:
         return (
-            "### Instruction:\n"
-            "Read the following medical article and write a concise, abstractive summary "
-            "in one or two sentences. Capture the main findings and conclusions. "
-            "Output only the summary, no preamble.\n\n"
+            f"### Task:\n{self._TASK_INSTRUCTION}\n"
             f"### Article:\n{article}\n\n"
             "### Summary:\n"
         )
 
     def _one_shot_prompt(self, article: str) -> str:
-        ex = ONE_SHOT_EXAMPLE
+        ex = ONE_SHOT_EXAMPLE[0]
         return (
-            "### Instruction:\n"
-            "Read the following medical article and write a concise, abstractive summary "
-            "in one or two sentences. Capture the main findings and conclusions. "
-            "Output only the summary, no preamble.\n\n"
-            "Here is an example:\n\n"
-            f"### Article:\n{ex['article']}\n\n"
-            f"### Summary:\n{ex['summary']}\n\n"
+            f"### Task:\n{self._TASK_INSTRUCTION}\n"
+            "### Reference Example:\n\n"
+            f"Article:\n{ex['article']}\n\n"
+            f"Summary:\n{ex['abstract']}\n\n"
+            "---\n\n"
             f"### Article:\n{article}\n\n"
             "### Summary:\n"
         )
 
     def _few_shot_prompt(self, article: str) -> str:
-        few_shot_text = ""
-        for ex in FEW_SHOT_EXAMPLES:
-            few_shot_text += (
-                f"### Article:\n{ex['article']}\n\n"
-                f"### Summary:\n{ex['summary']}\n\n"
+        references = ""
+        for i, ex in enumerate(FEW_SHOT_EXAMPLES, 1):
+            references += (
+                f"Reference {i}:\n"
+                f"Article:\n{ex['article']}\n\n"
+                f"Summary:\n{ex['abstract']}\n\n"
+                "---\n\n"
             )
         return (
-            "### Instruction:\n"
-            "Read the following medical article and write a concise, abstractive summary "
-            "in one or two sentences. Capture the main findings and conclusions. "
-            "Output only the summary, no preamble.\n\n"
-            "Here are some examples:\n\n"
-            f"{few_shot_text}"
+            f"### Task:\n{self._TASK_INSTRUCTION}\n"
+            f"### Reference Examples:\n\n{references}"
             f"### Article:\n{article}\n\n"
             "### Summary:\n"
         )
 
     def _cot_prompt(self, article: str) -> str:
         return (
-            "### Instruction:\n"
-            "Read the following medical article. First reason step by step about the "
-            "key points, then write a concise abstractive summary in one or two sentences.\n\n"
+            f"### Task:\n{self._TASK_INSTRUCTION}\n"
+            "Before writing the summary, reason step by step:\n\n"
             f"### Article:\n{article}\n\n"
-            "### Chain of Thought:\n"
-            "1. The main objective of the study is ...\n"
-            "2. The key findings are ...\n"
-            "3. The conclusion is ...\n"
+            "### Reasoning:\n"
+            "1. The main objective of this study is: ...\n"
+            "2. The methodology used is: ...\n"
+            "3. The key findings are: ...\n"
+            "4. The main conclusion is: ...\n\n"
             "### Summary:\n"
         )
 
@@ -221,6 +203,9 @@ class LLMPipeline:
             return ""
 
         prompt = self._build_prompt(article)
+        estimated_tokens = len(prompt.split()) * 1.3  # stima approssimativa
+        if estimated_tokens > 30000:
+            logger.warning(f"Prompt stimato a {estimated_tokens:.0f} token — vicino al limite context window")
         logger.debug(f"Prompt ({self.prompting_strategy}):\n{prompt[:200]}…")
 
         payload = {
