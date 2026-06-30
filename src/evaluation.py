@@ -1,35 +1,3 @@
-"""
-evaluation.py — Framework di Valutazione
-Progetto NLP: Clinical Summarization — NLP Tradizionale vs LLM
-
-Metriche implementate:
-  1. ROUGE-1, ROUGE-2, ROUGE-L     → qualità della sintesi vs Ground Truth
-  2. Precision, Recall, F1 (NER)   → conservazione entità cliniche
-  3. Hallucination Rate             → entità generate non ancorate all'articolo originale
-                                      (NER exact match + TF-IDF fallback per varianti morfologiche)
-  4. Execution Time                 → ms/esempio e totale
-
-Modifiche rispetto alla versione originale:
-  - [Bug fix / Qualità] compute_hallucination_rate(): aggiunto NER exact-match come
-    step primario prima del fallback TF-IDF. Questo risolve i falsi positivi su
-    abbreviazioni mediche (es. "HTN" ≠ "hypertension" per TF-IDF ma corrispondono
-    nel vocabolario scispaCy). Soglia TF-IDF abbassata da 0.3 a 0.15.
-  - [Qualità] Evaluator.evaluate(): il NER F1 confronta ora le entità della sintesi
-    con quelle dell'ARTICOLO ORIGINALE (original_texts) invece che con le entità
-    del ground truth abstract. Questo misura correttamente la fedeltà alla fonte,
-    non la sovrapposizione lessicale con il riferimento.
-  - [Perf] _semantic_similarity(): il TfidfVectorizer non viene più re-fittato
-    per ogni singola entità. compute_hallucination_rate() pre-fitta un vettorizzatore
-    per campione (entity_set + contesto) e lo riusa.
-  - [Qualità] compute_hallucination_rate(): aggiunto stemming-based matching
-    per catturare varianti morfologiche prima del fallback TF-IDF.
-
-Research Questions coperte:
-  RQ1 → ROUGE (qualità semantica Pipeline A vs B)
-  RQ2 → F1 NER (accuratezza estrazione entità cliniche rispetto all'articolo originale)
-  RQ3 → Hallucination Rate + Execution Time (trade-off computazionale)
-"""
-
 import logging
 import re
 import time
@@ -43,56 +11,24 @@ from bert_score import score as bert_score_fn
 
 logger = logging.getLogger(__name__)
 
-
-# ─────────────────────────────────────────────
-# Costanti
-# ─────────────────────────────────────────────
-
-# Soglia cosine similarity (TF-IDF fallback) sotto cui un'entità è considerata allucinazione.
-# Abbassata da 0.3 a 0.15: con la pre-normalizzazione NER e lo stemming, il TF-IDF
-# interviene solo per varianti morfologiche distanti — una soglia più bassa riduce
-# i falsi positivi sulle abbreviazioni.
 _HALLUCINATION_THRESHOLD = 0.15
-
 _ROUGE_TYPES = ["rouge1", "rouge2", "rougeL"]
 
-
-# ─────────────────────────────────────────────
-# Utilità: normalizzazione testo
-# ─────────────────────────────────────────────
-
 def _normalize(text: str) -> str:
-    """Lowercase, rimozione punteggiatura extra, strip."""
+    # Lowercase text and remove extra punctuation
     return re.sub(r"[^\w\s]", " ", text.lower()).strip()
 
 
 def _simple_stem(word: str) -> str:
-    """
-    Stemming euristico minimale (suffix stripping) per confronto morfologico.
-    Non sostituisce un vero stemmer ma cattura i casi più comuni in testi biomedici:
-    plurali (-s, -es), forme verbali (-ing, -ed, -tion → -t).
-    """
+    # Minimal heuristic suffix stripping for morphological evaluation
     for suffix in ("ations", "ation", "ings", "ing", "tions", "tion", "ed", "es", "s"):
         if word.endswith(suffix) and len(word) - len(suffix) >= 4:
             return word[: -len(suffix)]
     return word
 
 
-# ─────────────────────────────────────────────
-# 1. Metriche ROUGE
-# ─────────────────────────────────────────────
-
 def compute_rouge(predictions: list[str], references: list[str]) -> dict:
-    """
-    Calcola ROUGE-1, ROUGE-2 e ROUGE-L tra predizioni e Ground Truth.
-
-    Args:
-        predictions: Lista di sintesi generate dalla pipeline
-        references:  Lista di Summary (Ground Truth) dal dataset
-
-    Returns:
-        Dizionario con medie aggregate e valori per campione
-    """
+    # Computes standard ROUGE-1, ROUGE-2, and ROUGE-L F-measures
     scorer = rouge_scorer.RougeScorer(_ROUGE_TYPES, use_stemmer=True)
     per_sample = {rt: [] for rt in _ROUGE_TYPES}
 
@@ -115,47 +51,12 @@ def compute_rouge(predictions: list[str], references: list[str]) -> dict:
         results[f"{rt}_per_sample"] = per_sample[rt]
 
     return results
-# ─────────────────────────────────────────────
-# 1b. BERTScore
-# ─────────────────────────────────────────────
+
 
 def compute_bertscore(predictions: list[str],
                       references: list[str],
                       model_type: str = "bert-base-uncased") -> dict:
-    """
-    Calcola BERTScore tra predizioni e Ground Truth.
-
-    BERTScore misura la similarità semantica tra testo generato e riferimento
-    usando embeddings contestuali di un modello BERT. A differenza di ROUGE,
-    cattura la similarità semantica anche in assenza di overlap lessicale diretto.
-
-    Usiamo BERT standard (non BioBERT) perché è nella whitelist interna di
-    bert-score con baseline precalcolata per il rescaling. Il rescale
-    ("stira" la scala sottraendo la similarità media tra frasi casuali
-    scorrelate) rende i punteggi molto più discriminanti: senza rescale,
-    anche frasi semanticamente scorrelate ottengono cosine similarity alta
-    (~0.80-0.85) per come è strutturato lo spazio degli embedding contestuali,
-    schiacciando tutti i punteggi in un range stretto e poco informativo.
-    BioBERT, essendo fuori whitelist, non avrebbe questa baseline disponibile
-    (oltre ad avere richiesto un workaround num_layers e aver causato problemi
-    di compatibilità con versioni recenti di transformers/tokenizers).
-
-    Per il confronto Pipeline A (estrattiva) vs B (LLM/astrattiva) contro
-    l'abstract umano, ci interessa la similarità semantica generale tra frasi
-    in inglese — non terminologia medica specialistica — quindi un BERT
-    generalista è la scelta più appropriata e comparabile con la letteratura
-    (Zhang et al. 2020).
-
-    Args:
-        predictions: Lista di sintesi generate dalla pipeline
-        references:  Lista di abstract (Ground Truth)
-        model_type:  Modello BERT da usare per gli embeddings
-                     Default: bert-base-uncased (con baseline rescaling)
-
-    Returns:
-        Dizionario con precision, recall e F1 medi e per campione
-    """
-    # Filtra coppie con stringhe vuote — BERTScore va in errore su input vuoti
+    # Measures semantic similarity using contextual embeddings with baseline rescaling
     valid_preds, valid_refs, valid_indices = [], [], []
     for i, (pred, ref) in enumerate(zip(predictions, references)):
         if pred and pred.strip() and ref and ref.strip():
@@ -176,8 +77,8 @@ def compute_bertscore(predictions: list[str],
                 model_type=model_type,
                 lang="en",
                 verbose=False,
-                device=None,                  # usa GPU se disponibile, altrimenti CPU
-                rescale_with_baseline=True,    # vedi docstring: rende i punteggi discriminanti
+                device=None,
+                rescale_with_baseline=True,
             )
             for list_pos, orig_idx in enumerate(valid_indices):
                 precision_scores[orig_idx] = float(P[list_pos])
@@ -185,8 +86,7 @@ def compute_bertscore(predictions: list[str],
                 f1_scores[orig_idx]        = float(F1[list_pos])
 
         except Exception as e:
-            logger.error(f"Errore nel calcolo BERTScore: {e}. "
-                         "Verifica che 'bert-score' sia installato: pip install bert-score")
+            logger.error(f"Error computing BERTScore: {e}. Verify that 'bert-score' is installed.")
             import traceback
             logger.error(traceback.format_exc())
 
@@ -200,26 +100,9 @@ def compute_bertscore(predictions: list[str],
     }
 
 
-# ─────────────────────────────────────────────
-# 2. Metriche NER — Precision, Recall, F1
-# ─────────────────────────────────────────────
-
 def compute_ner_f1(predicted_entities: list[set],
                    reference_entities: list[set]) -> dict:
-    """
-    Calcola Precision, Recall e F1 per l'estrazione di entità mediche.
-
-    Il confronto avviene ora tra le entità della sintesi generata e le entità
-    dell'articolo originale (non del ground truth abstract), per misurare
-    correttamente la fedeltà alla fonte.
-
-    Args:
-        predicted_entities: Lista di set di entità estratte dalla sintesi generata
-        reference_entities: Lista di set di entità estratte dall'ARTICOLO ORIGINALE
-
-    Returns:
-        Dizionario con precision, recall, f1 aggregati e per campione
-    """
+    # Computes precision, recall, and F1 score for entity extraction against the reference source
     precision_scores, recall_scores, f1_scores = [], [], []
 
     for pred_set, ref_set in zip(predicted_entities, reference_entities):
@@ -261,57 +144,24 @@ def compute_ner_f1(predicted_entities: list[set],
     }
 
 
-# ─────────────────────────────────────────────
-# 3. Hallucination Rate
-# ─────────────────────────────────────────────
-
 def _entity_in_context(entity: str, context: str,
-                        context_tokens: Optional[set] = None,
-                        vectorizer: Optional[TfidfVectorizer] = None) -> bool:
-    """
-    Verifica se un'entità è ancorata al testo di contesto (articolo originale).
-
-    Strategia a tre livelli (fast path prima, TF-IDF solo come fallback):
-
-    1. Exact match (case-insensitive):
-       Cattura la maggioranza dei casi senza calcolo vettoriale.
-
-    2. Stem match:
-       Confronta i token stemmati dell'entità con i token stemmati del contesto.
-       Cattura varianti morfologiche (es. "treated" ↔ "treatment") e plurali.
-
-    3. TF-IDF cosine similarity (fallback):
-       Usato solo quando i primi due step falliscono. Cattura varianti semantiche
-       distanti (es. parafrasi, abbreviazioni non standard).
-       Usa il vettorizzatore pre-fittato passato come parametro (evita re-fit per entità).
-
-    Args:
-        entity:         Testo dell'entità estratta dalla sintesi LLM
-        context:        Testo dell'articolo originale
-        context_tokens: Set di token stemmati del contesto (pre-calcolato)
-        vectorizer:     TfidfVectorizer già fittato su [context] (pre-calcolato)
-
-    Returns:
-        True se l'entità è considerata ancorata al contesto, False altrimenti
-    """
+                      context_tokens: Optional[set] = None,
+                      vectorizer: Optional[TfidfVectorizer] = None) -> bool:
+    # Verifies entity alignment using exact match, stem matching, or TF-IDF similarity fallback
     if not entity.strip() or not context.strip():
         return False
 
     entity_norm = _normalize(entity)
     context_norm = _normalize(context)
 
-    # Step 1: exact match
     if entity_norm in context_norm:
         return True
 
-    # Step 2: stem match — tutti i token stemmati dell'entità devono
-    # apparire nel vocabolario stemmato del contesto
     entity_stems = {_simple_stem(t) for t in entity_norm.split() if len(t) > 2}
     if entity_stems and context_tokens is not None:
         if entity_stems.issubset(context_tokens):
             return True
 
-    # Step 3: TF-IDF cosine similarity (fallback)
     if vectorizer is not None:
         try:
             vec = vectorizer.transform([entity_norm])
@@ -329,31 +179,7 @@ def compute_hallucination_rate(
     original_texts: list[str],
     ner_fn: Callable,
 ) -> dict:
-    """
-    Calcola il tasso di allucinazione semantica per la Pipeline B (LLM).
-
-    Algoritmo per ogni coppia (sintesi, articolo_originale):
-      1. Estrae le entità mediche dalla sintesi (scispaCy)
-      2. Per ogni entità, verifica l'ancoraggio all'articolo con strategia a 3 livelli:
-         a. Exact match normalizzato
-         b. Stem match sui token dell'entità
-         c. TF-IDF cosine similarity (pre-fittato per campione, non per entità)
-      3. hallucination_rate = entità_non_ancorate / totale_entità
-
-    Miglioramenti rispetto all'originale:
-      - Il vettorizzatore TF-IDF viene fittato una volta per campione (non per entità),
-        riducendo il costo da O(n_samples × n_entities) a O(n_samples).
-      - Exact match e stem match come fast path eliminano il 70-80% delle chiamate TF-IDF.
-      - Soglia abbassata a 0.15 per ridurre falsi positivi sulle abbreviazioni.
-
-    Args:
-        generated_summaries: Sintesi generate dalla Pipeline B
-        original_texts:      Articoli originali corrispondenti
-        ner_fn:              Funzione NER (es. extract_medical_entities)
-
-    Returns:
-        Dizionario con hallucination_rate, total_entities_generated, total_hallucinations
-    """
+    # Calculates hallucination rate based on entities not anchored to the source text context
     rates        = []
     total_ents   = 0
     total_halluc = 0
@@ -372,11 +198,9 @@ def compute_hallucination_rate(
             rates.append(0.0)
             continue
 
-        # Pre-calcola strutture riusabili per questo campione
         context_norm   = _normalize(original)
         context_tokens = {_simple_stem(t) for t in context_norm.split() if len(t) > 2}
 
-        # Pre-fitta il vettorizzatore una sola volta sul contesto
         vectorizer = None
         if original.strip():
             try:
@@ -391,7 +215,7 @@ def compute_hallucination_rate(
                 entity, original,
                 context_tokens=context_tokens,
                 vectorizer=vectorizer,
-            )
+                )
             if not anchored:
                 hallucinations += 1
 
@@ -408,21 +232,8 @@ def compute_hallucination_rate(
     }
 
 
-# ─────────────────────────────────────────────
-# 4. Metriche Computazionali
-# ─────────────────────────────────────────────
-
 def compute_timing_metrics(exec_time_seconds: float, n_samples: int) -> dict:
-    """
-    Calcola le metriche di efficienza computazionale.
-
-    Args:
-        exec_time_seconds: Tempo totale di esecuzione in secondi
-        n_samples:         Numero di esempi processati
-
-    Returns:
-        Dizionario con tempo totale, medio per esempio e throughput
-    """
+    # Computes computational efficiency metrics
     ms_per_example = (exec_time_seconds / n_samples * 1000) if n_samples > 0 else 0.0
     return {
         "exec_time_seconds": round(exec_time_seconds, 3),
@@ -431,43 +242,21 @@ def compute_timing_metrics(exec_time_seconds: float, n_samples: int) -> dict:
     }
 
 
-# ─────────────────────────────────────────────
-# Classe principale: Evaluator
-# ─────────────────────────────────────────────
-
 class Evaluator:
-    """
-    Framework di valutazione unificato per entrambe le pipeline.
-
-    Calcola e aggrega tutte le metriche richieste dal progetto:
-      - ROUGE-1, ROUGE-2, ROUGE-L       (RQ1)
-      - Precision, Recall, F1 NER       (RQ2) — vs articolo originale
-      - Hallucination Rate              (RQ3 — solo Pipeline B)
-      - Execution Time / ms per esempio (RQ3)
-
-    Differenza chiave rispetto alla versione originale:
-      Il NER F1 ora confronta le entità della sintesi con quelle dell'ARTICOLO
-      ORIGINALE (original_texts) e non con quelle del ground truth abstract.
-      Questo è metodologicamente più corretto per misurare la fedeltà alla fonte.
-    """
+    # Unified evaluation framework comparing predictions against references and source texts
 
     def __init__(self, original_texts: list[str]):
-        """
-        Args:
-            original_texts: Lista degli articoli originali.
-                            Usati come riferimento per NER F1 e hallucination rate.
-        """
         self.original_texts = original_texts
 
         try:
             from src.NLPPipeline import extract_medical_entities
             self._ner_fn = extract_medical_entities
-            logger.info("Evaluator: NER scispaCy disponibile ✓")
+            logger.info("Evaluator: scispaCy NER available")
         except ImportError:
             self._ner_fn = lambda text: {"entities": [], "entity_texts": set(), "count": 0}
-            logger.warning("Evaluator: scispaCy non disponibile, NER disabilitato")
+            logger.warning("Evaluator: scispaCy not available, NER disabled")
 
-        logger.info(f"Evaluator inizializzato su {len(original_texts)} esempi")
+        logger.info(f"Evaluator initialized on {len(original_texts)} samples")
 
     def _extract_entity_sets(self, texts: list[str]) -> list[set]:
         result = []
@@ -486,48 +275,27 @@ class Evaluator:
         exec_time_seconds: float,
         compute_hallucinations: bool = True,
     ) -> dict:
-        """
-        Valutazione completa di una pipeline.
-
-        Args:
-            predictions:            Lista di sintesi generate dalla pipeline
-            references:             Lista di Summary (Ground Truth) per ROUGE
-            pipeline_label:         Etichetta identificativa (es. "Pipeline_A_Classical")
-            exec_time_seconds:      Tempo totale di esecuzione
-            compute_hallucinations: Se True, calcola l'hallucination rate
-                                    (rilevante principalmente per Pipeline B)
-
-        Returns:
-            Dizionario unificato con tutte le metriche aggregate
-        """
         n = len(predictions)
-        logger.info(f"[{pipeline_label}] Calcolo metriche su {n} esempi...")
+        logger.info(f"[{pipeline_label}] Computing metrics on {n} samples...")
 
         results = {"pipeline": pipeline_label, "n_samples": n}
 
-        # ── ROUGE (vs ground truth abstract) ───────────────────────────
-        logger.info(f"[{pipeline_label}] Calcolo ROUGE...")
+        logger.info(f"[{pipeline_label}] Computing ROUGE...")
         rouge_metrics = compute_rouge(predictions, references)
         results.update(rouge_metrics)
 
-        # ── BERTScore (vs ground truth abstract) ───────────────────────
-        logger.info(f"[{pipeline_label}] Calcolo BERTScore (BioBERT)...")
+        logger.info(f"[{pipeline_label}] Computing BERTScore...")
         bertscore_metrics = compute_bertscore(predictions, references)
         results.update(bertscore_metrics)
 
-        # ── NER F1 (vs articolo originale) ─────────────────────────────
-        # NOTA: il riferimento NER è ora original_texts (articolo), non references
-        # (abstract ground truth). Questo misura la fedeltà alla fonte, non la
-        # sovrapposizione lessicale con il ground truth.
-        logger.info(f"[{pipeline_label}] Calcolo NER F1 (vs articolo originale)...")
+        logger.info(f"[{pipeline_label}] Computing NER F1 (vs original text)...")
         pred_entities = self._extract_entity_sets(predictions)
         orig_entities = self._extract_entity_sets(self.original_texts)
         ner_metrics   = compute_ner_f1(pred_entities, orig_entities)
         results.update(ner_metrics)
 
-        # ── Hallucination Rate ──────────────────────────────────────────
         if compute_hallucinations:
-            logger.info(f"[{pipeline_label}] Calcolo Hallucination Rate...")
+            logger.info(f"[{pipeline_label}] Computing Hallucination Rate...")
             halluc_metrics = compute_hallucination_rate(
                 generated_summaries=predictions,
                 original_texts=self.original_texts,
@@ -541,7 +309,6 @@ class Evaluator:
                 "total_hallucinations":     0,
             })
 
-        # ── Timing ─────────────────────────────────────────────────────
         timing_metrics = compute_timing_metrics(exec_time_seconds, n)
         results.update(timing_metrics)
 
@@ -558,12 +325,7 @@ class Evaluator:
         return results
 
     def compare(self, metrics_a: dict, metrics_b: dict) -> dict:
-        """
-        Confronta le metriche di Pipeline A e Pipeline B.
-
-        Returns:
-            Dizionario con delta e winner per ogni metrica chiave
-        """
+        # Compares core metric updates and targets between Pipeline A and Pipeline B
         comparison_keys = {
             "rouge1":             "higher_is_better",
             "rouge2":             "higher_is_better",
@@ -595,10 +357,6 @@ class Evaluator:
         return comparison
 
 
-# ─────────────────────────────────────────────
-# Test rapido (eseguibile direttamente)
-# ─────────────────────────────────────────────
-
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -621,9 +379,7 @@ if __name__ == "__main__":
 
     evaluator = Evaluator(original_texts=originals)
 
-    print("\n" + "=" * 60)
-    print("TEST — Evaluator (NER F1 vs articolo originale)")
-    print("=" * 60)
+    print("TEST — Evaluator (NER F1 vs original text)")
 
     metrics_a = evaluator.evaluate(
         predictions=predictions_a,
@@ -641,7 +397,7 @@ if __name__ == "__main__":
         compute_hallucinations=True,
     )
 
-    print("\nConfronto Pipeline A vs B:")
+    print("\nComparison Pipeline A vs B:")
     comparison = evaluator.compare(metrics_a, metrics_b)
     for metric, info in comparison.items():
         print(
